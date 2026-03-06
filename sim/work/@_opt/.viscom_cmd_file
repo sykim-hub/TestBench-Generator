@@ -1,0 +1,1 @@
+C:/questasim64_2024.3/win64/VisualizerRls/bin/viscom.exe -nolock -quiet -jmem_size 344352 work.tb_dummy_counter -quiet -auto_acc_if_foreign -work work -debug,livesim +designfile -allow_unnamed -o _opt -id 1-0c7a1588c3cc-69aa3560-230-5458

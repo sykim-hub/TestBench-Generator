@@ -1,0 +1,130 @@
+/* Dark theme style for AutoSafeX */
+
+QWidget {
+    background-color: #12141c;
+    color: #e0e0e0;
+    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px;
+}
+
+/* Group Boxes */
+QGroupBox {
+    border: 1px solid #2a3040;
+    border-radius: 6px;
+    margin-top: 15px;
+    font-weight: bold;
+    color: #6a82ff;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 5px;
+    left: 10px;
+}
+
+/* Buttons */
+QPushButton {
+    background-color: #262c3d;
+    border: 1px solid #3d465c;
+    border-radius: 4px;
+    padding: 6px 15px;
+    color: #ffffff;
+    font-weight: 500;
+}
+
+QPushButton:hover {
+    background-color: #31384f;
+    border: 1px solid #5a6585;
+}
+
+QPushButton:pressed {
+    background-color: #1e2330;
+}
+
+QPushButton#generate_btn {
+    background-color: #4CAF50;
+    color: white;
+    font-weight: bold;
+    font-size: 14px;
+    border: none;
+    padding: 10px 20px;
+}
+
+QPushButton#generate_btn:hover {
+    background-color: #45a049;
+}
+
+QPushButton#generate_btn:pressed {
+    background-color: #3d8b40;
+}
+
+/* Text Inputs / SpinBoxes */
+QLineEdit, QDoubleSpinBox, QSpinBox {
+    background-color: #1e2330;
+    border: 1px solid #3d465c;
+    border-radius: 4px;
+    padding: 4px 8px;
+    color: #ffffff;
+}
+
+QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus {
+    border: 1px solid #6a82ff;
+}
+
+/* Text Editor */
+QTextEdit {
+    background-color: #0c0e14;
+    border: 1px solid #2a3040;
+    border-radius: 6px;
+    font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 5px;
+}
+
+/* Tabs */
+QTabWidget::pane {
+    border: 1px solid #2a3040;
+    border-radius: 6px;
+    background-color: #0c0e14;
+}
+
+QTabBar::tab {
+    background-color: #1e2330;
+    color: #a0a0a0;
+    border: 1px solid #2a3040;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 8px 16px;
+    margin-right: 2px;
+}
+
+QTabBar::tab:selected {
+    background-color: #0c0e14;
+    color: #6a82ff;
+    font-weight: bold;
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #262c3d;
+}
+
+/* Checkboxes & RadioButtons */
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1px solid #5a6585;
+    background-color: #1e2330;
+}
+
+QRadioButton::indicator {
+    border-radius: 8px;
+}
+
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background-color: #6a82ff;
+    border: 1px solid #6a82ff;
+}
