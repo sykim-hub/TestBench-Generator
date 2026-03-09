@@ -36,3 +36,6 @@ desktop.ini
 # Distribution
 *.tar.gz
 *.whl
+
+# Simulation
+sim/
