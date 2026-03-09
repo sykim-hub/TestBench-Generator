@@ -1,8 +1,6 @@
 import os
-import json
-import urllib.request
-import urllib.error
 import re
+
 
 class TestbenchGenerator:
     def __init__(self, template_path):
@@ -10,348 +8,364 @@ class TestbenchGenerator:
         with open(template_path, 'r', encoding='utf-8') as f:
             self.template = f.read()
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public entry point
+    # ──────────────────────────────────────────────────────────────────────────
     def generate(self, parsed_data, config):
         """
-        parsed_data: Output from HDLParser.parse()
-        config: Dictionary of user configurations like frequency, auto-reset, etc.
+        parsed_data : Output from HDLParser.parse()
+        config      : {
+            'tb_name'       : str,
+            'clocks'        : [{'name', 'frequency_mhz', 'duty_cycle', 'port'}, ...],
+            'resets'        : [{'name', 'active_low', 'delay_ns', 'auto_reset', 'port'}, ...],
+            'task_sequence' : [{'task_file', 'fork_type'}, ...],
+            'library_tasks' : [filename, ...],   # unique files to include
+        }
         """
         module_name = parsed_data.get('module_name', 'unknown_dut')
-        
-        # Helper to format signal declarations
-        def format_signals(sig_list, sig_type="reg"):
-            lines = []
-            for item in sig_list:
-                width = item.get('width', '')
-                width_str = f" {width}" if width else ""
-                lines.append(f"{sig_type}{width_str} {item['name']};")
-            return '\n'.join(lines)
+        tb_name     = config.get('tb_name', f'tb_{module_name}')
 
-        # 1. Signal Declarations
-        # Filter out clock and reset from the general input list to avoid double declaration
-        general_inputs = []
-        clock_name = config.get('clock_name', 'clk')
-        reset_name = config.get('reset_name', 'rst_n')
+        clocks  = config.get('clocks',  [{'name': 'clk',   'frequency_mhz': 100.0, 'duty_cycle': 50.0, 'port': 'clk'}])
+        resets  = config.get('resets',  [{'name': 'rst_n', 'active_low': True,    'delay_ns': 100.0,  'auto_reset': True, 'port': 'rst_n'}])
 
-        for item in parsed_data.get('inputs', []):
-            if item['name'] not in [clock_name, reset_name]:
-                general_inputs.append(item)
+        # Exclusion set: DUT port names AND TB signal names that are handled
+        # by clock/reset entries — prevents double `reg` declarations when the
+        # user names a TB signal the same as an unrelated DUT input port.
+        clk_rst_exclude = set()
+        for c in clocks:
+            clk_rst_exclude.add(c.get('port', c['name']))  # DUT port name
+            clk_rst_exclude.add(c['name'])                  # TB signal name
+        for r in resets:
+            clk_rst_exclude.add(r.get('port', r['name']))  # DUT port name
+            clk_rst_exclude.add(r['name'])                  # TB signal name
 
-        input_signals = format_signals(general_inputs, "reg")
-        output_signals = format_signals(parsed_data.get('outputs', []), "wire")
-        inout_signals = format_signals(parsed_data.get('inouts', []), "wire")
-        
-        clock_res_signals = []
-        if 'clock_name' in config:
-            clock_res_signals.append(f"reg {config['clock_name']} = 0;")
-        if 'reset_name' in config:
-            clock_res_signals.append(f"reg {config['reset_name']};")
-        clock_res_signals_str = '\n'.join(clock_res_signals)
+        # ── 1. Signal Declarations ───────────────────────────────────────────
+        def fmt_signals(sig_list, sig_type):
+            return '\n'.join(
+                f"{sig_type}{(' ' + s['width']) if s.get('width') else ''} {s['name']};"
+                for s in sig_list
+            )
 
-        # 1.5 Parameters
+        general_inputs  = [s for s in parsed_data.get('inputs',  []) if s['name'] not in clk_rst_exclude]
+        output_signals  = fmt_signals(parsed_data.get('outputs', []), 'wire')
+        inout_signals   = fmt_signals(parsed_data.get('inouts',  []), 'wire')
+        input_signals   = fmt_signals(general_inputs, 'reg')
+
+        # Clock & reset signal declarations
+        clk_rst_lines = []
+        for c in clocks:
+            clk_rst_lines.append(f"reg {c['name']} = 0;")
+        for r in resets:
+            clk_rst_lines.append(f"reg {r['name']};")
+        clock_res_signals_str = '\n'.join(clk_rst_lines)
+
+        # ── 1.5 Parameters ───────────────────────────────────────────────────
         param_decls = []
-        param_maps = []
-        parameters = parsed_data.get('parameters', [])
-        for param in parameters:
-            name = param['name']
-            value = param['value']
-            param_decls.append(f"parameter {name} = {value};")
-            param_maps.append(f".{name}({name})")
-            
+        param_maps  = []
+        for p in parsed_data.get('parameters', []):
+            param_decls.append(f"parameter {p['name']} = {p['value']};")
+            param_maps.append(f".{p['name']}({p['name']})")
         param_decl_str = '\n'.join(param_decls)
-        param_map_str = f"#({', '.join(param_maps)})" if param_maps else ""
+        param_map_str  = f"#({', '.join(param_maps)})" if param_maps else ""
 
-        # 2. Port Map
+        # ── 2. Port Map ────────────────────────────────────────────────
+        # Build tb-signal lookup: dut_port_name → tb_signal_name
+        # Process clocks first, then resets; later entries overwrite earlier ones
+        # if two entries share the same DUT port (user configuration conflict).
+        port_to_tb = {}          # {dut_port: tb_signal_name}
+        port_to_tb_src = {}      # {dut_port: 'clock'|'reset'} for conflict comments
+        for c in clocks:
+            dpt = c.get('port', c['name'])
+            port_to_tb[dpt]     = c['name']
+            port_to_tb_src[dpt] = 'clock'
+        for r in resets:
+            dpt = r.get('port', r['name'])
+            if dpt in port_to_tb and port_to_tb[dpt] != r['name']:
+                # Conflict: both a clock and a reset map to same DUT port
+                # Keep the reset (it will assert/de-assert), but flag it
+                port_to_tb_src[dpt] = f'CONFLICT: clock={port_to_tb[dpt]} overridden by reset={r["name"]}'
+            else:
+                port_to_tb_src[dpt] = 'reset'
+            port_to_tb[dpt] = r['name']
+
         port_mapping = []
-        for p_type in ['inputs', 'outputs', 'inouts']:
+        for p_type in ('inputs', 'outputs', 'inouts'):
             for item in parsed_data.get(p_type, []):
-                name = item['name']
-                port_mapping.append(f"    .{name}({name})")
+                dut_port = item['name']
+                tb_sig   = port_to_tb.get(dut_port, dut_port)  # remap if renamed
+                if tb_sig != dut_port:
+                    src = port_to_tb_src.get(dut_port, '')
+                    conflict_note = f'  // *** {src} ***' if 'CONFLICT' in src else f'  // {src}: {tb_sig} → .{dut_port}'
+                    port_mapping.append(f"    .{dut_port}({tb_sig}){conflict_note}")
+                else:
+                    port_mapping.append(f"    .{dut_port}({tb_sig})")
         port_map_str = ',\n'.join(port_mapping)
 
-        # 3. Clock Generation
-        clock_gen_str = ""
-        if 'clock_name' in config and config.get('frequency_mhz'):
-            freq = float(config['frequency_mhz'])
-            duty_cycle = float(config.get('duty_cycle', 50.0))
+        # ── 3. Multiple Clock Generations ───────────────────────────────────
+        clock_gen_lines = []
+        for c in clocks:
+            freq = float(c.get('frequency_mhz', 100.0))
+            duty = float(c.get('duty_cycle', 50.0))
             period_ns = 1000.0 / freq
-            
-            if duty_cycle == 50.0:
-                half_period = period_ns / 2.0
-                clock_gen_str = f"always #{half_period:.3f} {config['clock_name']} = ~{config['clock_name']};"
+            name = c['name']
+            if duty == 50.0:
+                hp = period_ns / 2.0
+                clock_gen_lines.append(f"always #{hp:.3f} {name} = ~{name};")
             else:
-                high_time = period_ns * (duty_cycle / 100.0)
-                low_time = period_ns - high_time
-                clock_linhas = [
+                hi = period_ns * (duty / 100.0)
+                lo = period_ns - hi
+                clock_gen_lines += [
                     f"always begin",
-                    f"    {config['clock_name']} = 1'b1;",
-                    f"    #{high_time:.3f};",
-                    f"    {config['clock_name']} = 1'b0;",
-                    f"    #{low_time:.3f};",
-                    f"end"
+                    f"    {name} = 1'b1; #{hi:.3f};",
+                    f"    {name} = 1'b0; #{lo:.3f};",
+                    f"end",
                 ]
-                clock_gen_str = '\n'.join(clock_linhas)
+        clock_gen_str = '\n'.join(clock_gen_lines)
 
-        # 4. Initial Block (Reset and Stimulus)
-        initial_block_lines = ["initial begin"]
-        
-        # Reset Sequence
-        delay = config.get('reset_delay_ns', 100)
-        
-        if config.get('auto_reset') and 'reset_name' in config:
-            active_low = config.get('reset_active_low', True)
-            assert_val = "0" if active_low else "1"
-            deassert_val = "1" if active_low else "0"
-            
-            initial_block_lines.append(f"    // Reset sequence")
-            initial_block_lines.append(f"    {config['reset_name']} = {assert_val};")
-            initial_block_lines.append(f"    #{delay};")
-            initial_block_lines.append(f"    {config['reset_name']} = {deassert_val};")
-            initial_block_lines.append(f"    ")
-            
-        initial_block_lines.append("    // --- Auto-Generated Stimulus ---")
-        
-        # Initialize other general inputs to 0
+        # ── 4. Initial Block ────────────────────────────────────────────────
+        initial_lines = ["initial begin"]
+
+        # 4a. Signal initialisation + parallel/sequential release
+        #
+        # New config keys: init_val, final_val, timing ('parallel'|'sequential'), auto
+        # Legacy keys still accepted: active_low, auto_reset
+        #
+        # Model:
+        #   T=0   → ALL auto signals are set to their init value simultaneously
+        #   Then  → parallel signals release inside a single fork...join (absolute time)
+        #   Then  → sequential signals fire one after another (relative delay from prev)
+
+        def _resolve(r):
+            """Normalise a reset/enable config dict to new-style keys."""
+            if 'init_val' in r:
+                return r                          # already new format
+            # Legacy: active_low → init=0/final=1 or init=1/final=0
+            al = r.get('active_low', True)
+            return {
+                'name':      r['name'],
+                'sig_type':  'Reset',
+                'init_val':  '0' if al else '1',
+                'final_val': '1' if al else '0',
+                'delay_ns':  r.get('delay_ns', 100),
+                'auto':      r.get('auto_reset', r.get('auto', True)),
+                'timing':    r.get('timing', 'parallel'),
+                'port':      r.get('port', r['name']),
+            }
+
+        resolved     = [_resolve(r) for r in resets]
+        auto_sigs    = [r for r in resolved if r.get('auto', True)]
+
         if general_inputs:
-            initial_block_lines.append("    // Initialize inputs")
+            initial_lines.append("    // ── Initialize inputs to 0 at T=0 ───────────────────────────────")
             for item in general_inputs:
-                width = item.get('width', '')
-                if width:
-                    # simplistic heuristic: if vector, set to 0
-                    initial_block_lines.append(f"    {item['name']} = 0;")
+                if item.get('width'):
+                    initial_lines.append(f"    {item['name']} = 0;")
                 else:
-                    initial_block_lines.append(f"    {item['name']} = 1'b0;")
-            initial_block_lines.append(f"    ")
+                    initial_lines.append(f"    {item['name']} = 1'b0;")
+            initial_lines.append("    ")
 
-        initial_block_lines.append(f"    // Wait for reset to finish")
-        initial_block_lines.append(f"    #( {delay} + 10 );")
-        initial_block_lines.append(f"    ")
-        
-        # Generate stimulus based on user selection
-        enable_random = config.get('enable_random', True)
-        lib_tasks = config.get('library_tasks', [])
-        
-        if general_inputs:
-            clock_name = config.get('clock_name', 'clk')
-            
-            if enable_random:
-                initial_block_lines.append("    // Apply random stimulus vectors")
-                initial_block_lines.append("    repeat(20) begin")
-                initial_block_lines.append(f"        @(posedge {clock_name});")
-                for item in general_inputs:
-                    initial_block_lines.append(f"        {item['name']} <= $urandom;")
-                initial_block_lines.append("    end")
-                initial_block_lines.append(f"    ")
-                
+        if auto_sigs:
+            initial_lines.append("    // ── Set initial control values at T=0 ──────────────────────────")
+            for r in auto_sigs:
+                comment = f"  // {r['sig_type']}: {r['init_val']}→{r['final_val']}"
+                initial_lines.append(f"    {r['name']} = 1'b{r['init_val']};{comment}")
+            initial_lines.append("    ")
 
-            if lib_tasks and "None Available" not in lib_tasks:
-                initial_block_lines.append("    // Apply Task-based Stimulus")
-                initial_block_lines.append("    // NOTE: Call your custom tasks here")
-                initial_block_lines.append("    apply_generic_stimulus(32'hDEADBEEF);")
-                initial_block_lines.append(f"    ")
+            initial_lines.append("    // ── Control Sequence ───────────────────────────────────────────")
+            # Group adjacent signals where `timing` == 'parallel'. Isolated signals run sequentially.
+            groups = []
+            i = 0
+            while i < len(auto_sigs):
+                r = auto_sigs[i]
+                if r.get('timing', 'sequential') == 'parallel':
+                    batch = [r]
+                    i += 1
+                    while i < len(auto_sigs) and auto_sigs[i].get('timing', 'sequential') == 'parallel':
+                        batch.append(auto_sigs[i])
+                        i += 1
+                    groups.append(batch)
+                else:
+                    groups.append([r])
+                    i += 1
 
-        initial_block_lines.append("    // Give some time to observe last changes")
-        initial_block_lines.append("    #500;")
-        initial_block_lines.append("    $finish;")
-        initial_block_lines.append("end")
-        
-        # -------------------------------------------------------------------------
-        # Intelligent Stimulus Task Generation
-        # -------------------------------------------------------------------------
-        if general_inputs and lib_tasks and "None Available" not in lib_tasks:
-            clock_name = config.get('clock_name', 'clk')
-            initial_block_lines.append("")
-            initial_block_lines.append("// -----------------------------------------------------------------------------")
-            
-            initial_block_lines.append("// Stimulus Tasks (From Library)")
-            initial_block_lines.append("// -----------------------------------------------------------------------------")
-            tasks_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'templates', 'tasks')
-            
-            for task_name in lib_tasks:
-                task_path = os.path.join(tasks_dir, task_name)
+            def _get_delay(r):
+                val = r.get('delay_ns', 100.0)
+                if r.get('delay_unit', 'ns') == 'cycles':
+                    cycles = int(val)
+                    clk = r.get('delay_clock', 'clk')
+                    return f"repeat({cycles}) @(posedge {clk});" if cycles > 0 else ""
+                else:
+                    return f"#{val:.1f};"
+
+            for grp in groups:
+                if len(grp) == 1:
+                    r = grp[0]
+                    delay_stmt = _get_delay(r)
+                    initial_lines.append(f"    // {r['sig_type']}: {r['name']}")
+                    if delay_stmt:
+                        initial_lines.append(f"    {delay_stmt}")
+                    initial_lines.append(f"    {r['name']} = 1'b{r['final_val']};")
+                else:
+                    initial_lines.append("    fork")
+                    for r in grp:
+                        delay_stmt = _get_delay(r)
+                        initial_lines.append(f"        begin  // {r['sig_type']}: {r['name']}")
+                        if delay_stmt:
+                            initial_lines.append(f"            {delay_stmt}")
+                        initial_lines.append(f"            {r['name']} = 1'b{r['final_val']};")
+                        initial_lines.append( "        end")
+                    initial_lines.append("    join")
+            initial_lines.append("    ")
+
+        # 4c. Sync to the first clock edge after all transitions are done
+        primary_clk = clocks[0]['name'] if clocks else 'clk'
+        initial_lines.append("    // Sync to clock edge — all init transitions are complete")
+        initial_lines.append(f"    @(posedge {primary_clk});")
+        initial_lines.append("    ")
+
+        # 4d. User task sequence — group consecutive same-type fork entries
+        task_sequence = config.get('task_sequence', [])
+        if task_sequence:
+            initial_lines.append("    // ── User Task Sequence ────────────────────────────────────")
+
+            # Group consecutive tasks that share the same (non-sequential) fork type
+            # so they become a SINGLE fork block together instead of isolated ones.
+            groups = []
+            i = 0
+            while i < len(task_sequence):
+                ft = task_sequence[i].get('fork_type', 'sequential')
+                if ft == 'sequential':
+                    groups.append({'type': 'sequential', 'tasks': [task_sequence[i]]})
+                    i += 1
+                else:
+                    batch = [task_sequence[i]]
+                    i += 1
+                    while i < len(task_sequence) and task_sequence[i].get('fork_type') == ft:
+                        batch.append(task_sequence[i])
+                        i += 1
+                    groups.append({'type': ft, 'tasks': batch})
+
+            for grp in groups:
+                calls = []
+                for ts in grp['tasks']:
+                    tname = self._extract_task_name(ts['task_file'], config)
+                    calls.append(f"        {tname or ('/* ' + ts['task_file'] + ' */')}();")
+
+                if grp['type'] == 'sequential':
+                    for c in calls:
+                        initial_lines.append(c.lstrip())  # no indent prefix
+                else:
+                    join_kw = {
+                        'fork...join':      'join',
+                        'fork...join_any':  'join_any',
+                        'fork...join_none': 'join_none',
+                    }[grp['type']]
+                    initial_lines.append("    fork")
+                    initial_lines.extend(calls)
+                    initial_lines.append(f"    {join_kw}")
+            initial_lines.append("    ")
+
+        initial_lines.append("    // Observe final state")
+        initial_lines.append("    #500;")
+        initial_lines.append("    $finish;")
+        initial_lines.append("end")
+
+        # ── 5. Task Definitions (from library) ───────────────────────────────
+        library_tasks = config.get('library_tasks', [])
+        if library_tasks:
+            tasks_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                'templates', 'tasks'
+            )
+            task_defs_lines = [
+                "",
+                "// ─────────────────────────────────────────────────────────────────────────",
+                "// Task Definitions (from library)",
+                "// ─────────────────────────────────────────────────────────────────────────",
+            ]
+            port_names = [p['name'] for p in (general_inputs + parsed_data.get('outputs', []))]
+            for task_file in library_tasks:
+                task_path = os.path.join(tasks_dir, task_file)
                 try:
-                    with open(task_path, 'r', encoding='utf-8') as f:
-                        raw_task = f.read()
-                        
-                        # Extremely simple auto-mapping for UART and SPI to reduce user editing
-                        port_names = [p['name'] for p in (general_inputs + parsed_data.get('outputs', []))]
-                        
-                        # Map UART TX
-                        uart_rxd_port = next((p for p in port_names if 'rxd' in p.lower() or 'uart_rx' in p.lower()), None)
-                        if uart_rxd_port and 'uart_tx' in raw_task:
-                            raw_task = re.sub(r'\buart_tx\b', uart_rxd_port, raw_task)
-                            initial_block_lines.append(f"    // Auto-mapped 'uart_tx' to '{uart_rxd_port}'")
-                            
-                        # Map UART RX
-                        uart_txd_port = next((p for p in port_names if 'txd' in p.lower() or 'uart_tx' in p.lower()), None)
-                        if uart_txd_port and 'uart_rx' in raw_task:
-                            raw_task = re.sub(r'\buart_rx\b', uart_txd_port, raw_task)
-                            initial_block_lines.append(f"    // Auto-mapped 'uart_rx' to '{uart_txd_port}'")
-                            
-                        # Map SPI MOSI
-                        spi_mosi_port = next((p for p in port_names if 'mosi' in p.lower()), None)
-                        if spi_mosi_port and 'mosi' in raw_task:
-                            raw_task = re.sub(r'\bmosi\b', spi_mosi_port, raw_task)
-                        # Map SPI MISO
-                        spi_miso_port = next((p for p in port_names if 'miso' in p.lower()), None)
-                        if spi_miso_port and 'miso' in raw_task:
-                            raw_task = re.sub(r'\bmiso\b', spi_miso_port, raw_task)
-                        # Map SPI CS
-                        spi_cs_port = next((p for p in port_names if 'cs' in p.lower() or 'ss' in p.lower()), None)
-                        if spi_cs_port and 'cs_n' in raw_task:
-                            raw_task = re.sub(r'\bcs_n\b', spi_cs_port, raw_task)
+                    with open(task_path, 'r', encoding='utf-8') as fh:
+                        raw = fh.read()
 
-                        initial_block_lines.extend(raw_task.splitlines())
+                    # Auto-map well-known signal patterns to actual DUT ports
+                    raw = self._auto_map_ports(raw, port_names)
+                    task_defs_lines.extend(raw.splitlines())
+                    task_defs_lines.append("")
                 except Exception as e:
-                    initial_block_lines.append(f"// Error loading task {task_name}: {str(e)}")
-                    
-            # Update the placeholder in the initial block with actual task calls
-            call_statements = []
-            for task_name in lib_tasks:
-                task_path = os.path.join(tasks_dir, task_name)
-                if os.path.exists(task_path):
-                    with open(task_path, 'r', encoding='utf-8') as f:
-                        raw = f.read()
-                        # Find task names and inputs
-                        task_matches = re.finditer(r'\btask\s+(\w+);([\s\S]*?)\bbegin\b', raw)
-                        for match in task_matches:
-                            t_name = match.group(1)
-                            args_block = match.group(2)
-                            # Find inputs
-                            inputs = re.findall(r'\binput\s+(?:\[.*?\]\s*)?(\\w+)\s*;', args_block)
-                            
-                            if inputs:
-                                args_str = ", ".join([f"/*{inp}*/ 0" for inp in inputs])
-                                call_statements.append(f"    {t_name}({args_str});")
-                            else:
-                                call_statements.append(f"    {t_name}();")
-                                
-            # Replace 'apply_generic_stimulus' placeholder with actual task calls
-            for i, line in enumerate(initial_block_lines):
-                if "apply_generic_stimulus" in line:
-                    if call_statements:
-                        initial_block_lines[i] = "    // Call your customized library tasks here:\n" + "\n".join(call_statements)
-                    else:
-                        initial_block_lines[i] = f"    // Call your customized library tasks here: {', '.join(lib_tasks)}"
+                    task_defs_lines.append(f"// Error loading '{task_file}': {e}")
 
-            # Simple Protocol Detection Heuristics (OUTSIDE the for loop above!)
-            port_names_lower = [p['name'].lower() for p in (general_inputs + parsed_data.get('outputs', []))]
-            is_axi = any(p.startswith('awaddr') or p.startswith('s_axi_awaddr') or p.endswith('_awaddr') for p in port_names_lower)
-            is_apb = any(p == 'paddr' or p.endswith('_paddr') for p in port_names_lower)
-            is_i2c = any(p == 'scl' or p == 'sda' for p in port_names_lower)
-            
-            if is_axi:
-                # Add basic AXI-Lite Write/Read Skeletons
-                initial_block_lines.extend([
-                    "task axi_write;",
-                    "    input [31:0] addr;",
-                    "    input [31:0] data;",
-                    "begin",
-                    f"    @(posedge {clock_name}); // AXI Write Address Phase",
-                    "    // awvalid <= 1; awaddr <= addr; ... (Add your specific AXI ports here)",
-                    f"    @(posedge {clock_name});",
-                    "    // awvalid <= 0;",
-                    f"    @(posedge {clock_name}); // AXI Write Data Phase",
-                    "    // wvalid <= 1; wdata <= data; ...",
-                    f"    @(posedge {clock_name});",
-                    "    // wvalid <= 0;",
-                    "end",
-                    "endtask\n",
-                    "task axi_read;",
-                    "    input [31:0] addr;",
-                    "begin",
-                    f"    @(posedge {clock_name}); // AXI Read Address Phase",
-                    "    // arvalid <= 1; araddr <= addr; ...",
-                    f"    @(posedge {clock_name});",
-                    "    // arvalid <= 0;",
-                    "end",
-                    "endtask"
-                ])
-                # update the initial block placeholder to use axi
-                for i, line in enumerate(initial_block_lines):
-                    if "apply_generic_stimulus" in line:
-                        initial_block_lines[i] = "    // axi_write(32'h1000, 32'hDEADBEEF);"
-        
-            elif is_apb:
-                # Add APB task skeleton
-                initial_block_lines.extend([
-                    "task apb_write;",
-                    "    input [31:0] addr;",
-                    "    input [31:0] data;",
-                    "begin",
-                    f"    @(posedge {clock_name}); // Setup Phase",
-                    "    // psel <= 1; pwrite <= 1; paddr <= addr; pwdata <= data;",
-                    f"    @(posedge {clock_name}); // Access Phase",
-                    "    // penable <= 1;",
-                    f"    @(posedge {clock_name}); // Wait for pready etc.",
-                    "    // psel <= 0; penable <= 0;",
-                    "end",
-                    "endtask\n",
-                    "task apb_read;",
-                    "    input [31:0] addr;",
-                    "begin",
-                    f"    @(posedge {clock_name});",
-                    "    // psel <= 1; pwrite <= 0; paddr <= addr;",
-                    f"    @(posedge {clock_name});",
-                    "    // penable <= 1;",
-                    f"    @(posedge {clock_name});",
-                    "    // psel <= 0; penable <= 0;",
-                    "end",
-                    "endtask"
-                ])
-                for i, line in enumerate(initial_block_lines):
-                    if "apply_generic_stimulus" in line:
-                        initial_block_lines[i] = "    // apb_write(32'h1000, 32'hDEADBEEF);"
-                
-            elif is_i2c:
-                # Add I2C task skeleton
-                initial_block_lines.extend([
-                    "task i2c_start;",
-                    "begin",
-                    "    // sda <= 0; #5; scl <= 0;",
-                    "end",
-                    "endtask\n",
-                    "task i2c_stop;",
-                    "begin",
-                    "    // sda <= 0; #5; scl <= 1; #5; sda <= 1;",
-                    "end",
-                    "endtask\n",
-                    "task i2c_write_byte;",
-                    "    input [7:0] data;",
-                    "begin",
-                    "    // for (int i=7; i>=0; i--) begin",
-                    "    //    sda <= data[i]; #5; scl <= 1; #5; scl <= 0;",
-                    "    // end",
-                    "    // // Handle ACK...",
-                    "end",
-                    "endtask"
-                ])
-                for i, line in enumerate(initial_block_lines):
-                    if "apply_generic_stimulus" in line:
-                        initial_block_lines[i] = "    // i2c_start(); // i2c_write_byte(8'hA0); // i2c_stop();"
-            else:
-                # Fallback to the generic task
-                initial_block_lines.append("task apply_generic_stimulus;")
-                initial_block_lines.append("    input [31:0] data_val;")
-                initial_block_lines.append("begin")
-                initial_block_lines.append(f"    @(posedge {clock_name});")
-                for item in general_inputs:
-                    if 'data' in item['name'].lower() or 'val' in item['name'].lower():
-                        initial_block_lines.append(f"    {item['name']} <= data_val;")
-                    else: # Control signals like enable / write
-                        initial_block_lines.append(f"    {item['name']} <= 1'b1;")
-        initial_block_str = '\n'.join(initial_block_lines)
+            initial_lines.extend(task_defs_lines)
 
-        # Replace placeholders in template
-        output_tb = self.template
-        output_tb = output_tb.replace("{MODULE_NAME}", module_name)
-        output_tb = output_tb.replace("{PARAMETER_DECLARATIONS}", param_decl_str)
-        output_tb = output_tb.replace("{PARAMETER_MAP}", param_map_str)
-        output_tb = output_tb.replace("{CLOCK_RES_SIGNALS}", clock_res_signals_str)
-        output_tb = output_tb.replace("{INPUT_SIGNALS}", input_signals)
-        output_tb = output_tb.replace("{OUTPUT_SIGNALS}", output_signals)
-        output_tb = output_tb.replace("{INOUT_SIGNALS}", inout_signals)
-        output_tb = output_tb.replace("{PORT_MAP}", port_map_str)
-        output_tb = output_tb.replace("{CLOCK_GENERATION}", clock_gen_str)
-        output_tb = output_tb.replace("{INITIAL_BLOCK}", initial_block_str)
+        initial_block_str = '\n'.join(initial_lines)
 
-        return output_tb
+        # ── 6. Fill template ─────────────────────────────────────────────────
+        out = self.template
+        out = out.replace("{MODULE_NAME}",           module_name)
+        out = out.replace("{TB_MODULE_NAME}",        tb_name)
+        out = out.replace("{PARAMETER_DECLARATIONS}", param_decl_str)
+        out = out.replace("{PARAMETER_MAP}",         param_map_str)
+        out = out.replace("{CLOCK_RES_SIGNALS}",     clock_res_signals_str)
+        out = out.replace("{INPUT_SIGNALS}",         input_signals)
+        out = out.replace("{OUTPUT_SIGNALS}",        output_signals)
+        out = out.replace("{INOUT_SIGNALS}",         inout_signals)
+        out = out.replace("{PORT_MAP}",              port_map_str)
+        out = out.replace("{CLOCK_GENERATION}",      clock_gen_str)
+        out = out.replace("{INITIAL_BLOCK}",         initial_block_str)
+
+        return out
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _extract_task_name(self, task_file, config):
+        """Return the first task name declared in the snippet file."""
+        tasks_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            'templates', 'tasks'
+        )
+        task_path = os.path.join(tasks_dir, task_file)
+        if not os.path.exists(task_path):
+            return None
+        try:
+            with open(task_path, 'r', encoding='utf-8') as fh:
+                raw = fh.read()
+            m = re.search(r'\btask\s+(\w+)\s*;', raw)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return None
+
+    def _auto_map_ports(self, raw_task: str, port_names: list) -> str:
+        """Best-effort auto-mapping of placeholder signal names to actual DUT port names."""
+        lower_ports = {p.lower(): p for p in port_names}
+
+        def replace_if_match(pattern_name, raw, lower_ports):
+            actual = lower_ports.get(pattern_name)
+            if actual:
+                raw = re.sub(r'\b' + re.escape(pattern_name) + r'\b', actual, raw)
+            return raw
+
+        # UART
+        for pn in ['uart_rx', 'rxd']:
+            actual = next((lower_ports[k] for k in lower_ports if 'rxd' in k or 'uart_rx' in k), None)
+            if actual:
+                raw_task = re.sub(r'\buart_tx\b', actual, raw_task)
+                break
+        for pn in ['uart_tx', 'txd']:
+            actual = next((lower_ports[k] for k in lower_ports if 'txd' in k or 'uart_tx' in k), None)
+            if actual:
+                raw_task = re.sub(r'\buart_rx\b', actual, raw_task)
+                break
+
+        # SPI
+        for placeholder, matcher in [('mosi', 'mosi'), ('miso', 'miso'), ('cs_n', 'cs'), ('sclk', 'sclk')]:
+            actual = next((lower_ports[k] for k in lower_ports if matcher in k), None)
+            if actual:
+                raw_task = re.sub(r'\b' + re.escape(placeholder) + r'\b', actual, raw_task)
+
+        return raw_task

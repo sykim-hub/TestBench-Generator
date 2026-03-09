@@ -1,10 +1,10 @@
-/* Dark theme style for AutoSafeX */
+/* Dark theme style for TestBench Generator */
 
 QWidget {
     background-color: #12141c;
     color: #e0e0e0;
     font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-    font-size: 13px;
+    font-size: 10pt;
 }
 
 /* Group Boxes */
@@ -42,21 +42,10 @@ QPushButton:pressed {
     background-color: #1e2330;
 }
 
-QPushButton#generate_btn {
-    background-color: #4CAF50;
-    color: white;
-    font-weight: bold;
-    font-size: 14px;
-    border: none;
-    padding: 10px 20px;
-}
-
-QPushButton#generate_btn:hover {
-    background-color: #45a049;
-}
-
-QPushButton#generate_btn:pressed {
-    background-color: #3d8b40;
+/* Auto-save indicator style */
+QLabel#autoSaveLabel {
+    color: #6a82ff;
+    font-style: italic;
 }
 
 /* Text Inputs / SpinBoxes */
@@ -77,9 +66,8 @@ QTextEdit {
     background-color: #0c0e14;
     border: 1px solid #2a3040;
     border-radius: 6px;
-    font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
-    font-size: 13px;
-    line-height: 1.5;
+    font-family: "Consolas", monospace;
+    font-size: 12pt;
     padding: 5px;
 }
 
@@ -128,3 +116,52 @@ QCheckBox::indicator:checked, QRadioButton::indicator:checked {
     background-color: #6a82ff;
     border: 1px solid #6a82ff;
 }
+
+/* Clock / Reset / Task entry frames */
+QFrame#clockEntry, QFrame#resetEntry {
+    background-color: #1a1e2b;
+    border: 1px solid #2e3650;
+    border-radius: 5px;
+}
+
+/* ComboBox */
+QComboBox {
+    background-color: #1e2330;
+    border: 1px solid #3d465c;
+    border-radius: 4px;
+    padding: 3px 8px;
+    color: #ffffff;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+QComboBox QAbstractItemView {
+    background-color: #1e2330;
+    border: 1px solid #3d465c;
+    selection-background-color: #6a82ff;
+    color: #ffffff;
+}
+
+/* List Widget */
+QListWidget {
+    background-color: #0c0e14;
+    border: 1px solid #2a3040;
+    border-radius: 4px;
+    color: #e0e0e0;
+    font-size: 10pt;
+}
+QListWidget::item:selected {
+    background-color: #262c3d;
+    color: #6a82ff;
+}
+QListWidget::item:hover {
+    background-color: #1a1e2b;
+}
+
+/* Splitter */
+QSplitter::handle {
+    background-color: #2a3040;
+    width: 2px;
+}
+

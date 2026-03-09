@@ -1,10 +1,11 @@
 // -----------------------------------------------------------------------------
-// AutoSafeX Auto-Generated Testbench
-// Module: {MODULE_NAME}
+// TestBench Generator - Auto-Generated Testbench
+// DUT   : {MODULE_NAME}
+// TB    : {TB_MODULE_NAME}
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
-module tb_{MODULE_NAME}();
+module {TB_MODULE_NAME}();
 
 // -----------------------------------------------------------------------------
 // Parameters
